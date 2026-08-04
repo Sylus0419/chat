@@ -1040,3 +1040,64 @@ html:not([data-theme="dark"])[data-color-theme="black-white"] .message-sent{
         }
     };
 })();
+// ============================================================
+// 新增：主动邀请视频通话（带微信风格铃声）
+// ============================================================
+if (typeof window.startCallInvite !== 'function') {
+    window.startCallInvite = function() {
+        if (typeof S === 'undefined' || !S.enabled) {
+            if (typeof showNotification === 'function') showNotification('通话功能未开启', 'warning');
+            return;
+        }
+        if (S.active) {
+            if (typeof showNotification === 'function') showNotification('通话进行中', 'info');
+            return;
+        }
+
+        var overlay = document.getElementById('call-incoming-overlay');
+        if (!overlay) return;
+
+        overlay.querySelector('.call-inc-name').textContent = '正在邀请对方…';
+        overlay.querySelector('.call-inc-sub span').textContent = '等待对方接听…';
+        overlay.querySelector('.call-inc-accept').style.display = 'none';
+        var rejectBtn = overlay.querySelector('.call-inc-reject');
+        rejectBtn.innerHTML = '<div class="call-inc-circle" style="background:linear-gradient(135deg,#ff5252,#c62828);box-shadow:0 6px 20px rgba(255,82,82,.45);"><i class="fas fa-phone-slash" style="font-size:24px;color:#fff;"></i></div><span class="call-inc-lbl">挂断</span>';
+        overlay.classList.add('visible');
+
+        playInviteRingtone();
+
+        if (window._inviteTimer) clearTimeout(window._inviteTimer);
+        window._inviteTimer = setTimeout(function() {
+            overlay.classList.remove('visible');
+            overlay.querySelector('.call-inc-accept').style.display = '';
+            overlay.querySelector('.call-inc-reject').innerHTML = '<div class="call-inc-circle" style="background:linear-gradient(135deg,#ff5252,#c62828);box-shadow:0 6px 20px rgba(255,82,82,.45);"><i class="fas fa-phone-slash" style="font-size:24px;color:#fff;"></i></div><span class="call-inc-lbl">拒绝</span>';
+            if (typeof startCall === 'function') startCall(true);
+        }, 10000);
+
+        rejectBtn.onclick = function(e) {
+            e.stopPropagation();
+            clearTimeout(window._inviteTimer);
+            overlay.classList.remove('visible');
+            if (typeof showNotification === 'function') showNotification('已取消邀请', 'info');
+        };
+    };
+}
+
+function playInviteRingtone() {
+    try {
+        var ctx = new (window.AudioContext || window.webkitAudioContext)();
+        var count = 0;
+        var interval = setInterval(function() {
+            if (count++ >= 3) { clearInterval(interval); return; }
+            var osc = ctx.createOscillator();
+            var gain = ctx.createGain();
+            osc.type = 'sine';
+            osc.frequency.value = 440;
+            gain.gain.value = 0.3;
+            osc.connect(gain);
+            gain.connect(ctx.destination);
+            osc.start();
+            osc.stop(ctx.currentTime + 0.3);
+        }, 600);
+    } catch(e) { console.warn('铃声播放失败', e); }
+}
