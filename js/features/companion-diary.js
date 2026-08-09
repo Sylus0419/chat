@@ -35,23 +35,92 @@
 
     // ─── 存储 ───────────────────────────────────────
     function getKey() {
-        const prefix = window.APP_PREFIX || '';
-        return prefix + 'companionDiary';
+        // 带 SESSION_ID 前缀，与同步引擎一致
+        if (typeof getStorageKey === 'function' && typeof SESSION_ID !== 'undefined' && SESSION_ID) {
+            try { return getStorageKey('companionDiary'); } catch (e) {}
+        }
+        return (window.APP_PREFIX || '') + 'companionDiary';
+    }
+    // 旧键名（无 SESSION_ID），用于一次性迁移
+    function _getOldKey() {
+        return (window.APP_PREFIX || '') + 'companionDiary';
     }
     async function loadDiary() {
+        // 保险方案：不依赖 SESSION_ID 是否就绪，直接扫描 localforage 所有 key。
+        // 原因：SESSION_ID 由 core.js 异步初始化，在低端 Android 设备上可能比
+        // DOMContentLoaded 慢几百毫秒，导致 getKey() 返回无 SESSION_ID 的旧 key，
+        // 读到空数据后 _diaryEntries 被清空，日记消失。
+        // 扫描 key 的方式和 cdRec 系统一样，不依赖任何变量，100% 可靠。
         try {
-            const data = await localforage.getItem(getKey());
-            _diaryEntries = Array.isArray(data) ? data : [];
+            const allKeys = await localforage.keys();
+
+            // 找出所有日记相关 key（排除背景 key）
+            const diaryKeys = allKeys.filter(function(k) {
+                return k.indexOf('companionDiary') !== -1
+                    && k.indexOf('DiaryBg') === -1
+                    && k.indexOf('DiaryBgGallery') === -1;
+            });
+
+            // 把所有 key 里的数据全部读出来，按 id 去重合并
+            // 这样能兼容新 key、旧 key、以及任何中间状态
+            const merged = [];
+            const seenIds = new Set();
+            for (var i = 0; i < diaryKeys.length; i++) {
+                const chunk = await localforage.getItem(diaryKeys[i]);
+                if (!Array.isArray(chunk)) continue;
+                for (var j = 0; j < chunk.length; j++) {
+                    const entry = chunk[j];
+                    if (entry && entry.id && !seenIds.has(String(entry.id))) {
+                        seenIds.add(String(entry.id));
+                        merged.push(entry);
+                    }
+                }
+            }
+
+            _diaryEntries = merged;
+
+            // 如果 SESSION_ID 已就绪，把合并后的数据写到正规 key，并清理旧 key
+            const newKey = getKey();
+            const oldKey = _getOldKey();
+            if (newKey !== oldKey && merged.length > 0) {
+                // 检查是否有数据在旧 key 上需要清理
+                const hadOldData = diaryKeys.some(function(k) { return k === oldKey; });
+                if (hadOldData) {
+                    await localforage.setItem(newKey, merged);
+                    await localforage.removeItem(oldKey);
+                    console.log('[companion-diary] 日记数据已合并迁移到新键名，共', merged.length, '条');
+                    if (window.CloudSyncEngine && window.CloudSyncEngine.requestSyncNow) {
+                        setTimeout(function() { window.CloudSyncEngine.requestSyncNow(); }, 500);
+                    }
+                }
+            }
         } catch (e) {
             console.warn('[companion-diary] load failed:', e);
             _diaryEntries = [];
         }
         // 确保按时间倒序
         _diaryEntries.sort((a, b) => b.ts - a.ts);
-        window._companionDiaryEntries = _diaryEntries; // 暴露给外部（companion.js 写入用）
+        window._companionDiaryEntries = _diaryEntries;
     }
     async function saveDiary() {
         try {
+            // 安全保护：如果内存里是空的，先确认 localforage 里也是空的再写。
+            // 防止任何时序问题导致用空数组覆盖真实数据。
+            if (_diaryEntries.length === 0) {
+                const allKeys = await localforage.keys();
+                const diaryKeys = allKeys.filter(function(k) {
+                    return k.indexOf('companionDiary') !== -1
+                        && k.indexOf('DiaryBg') === -1
+                        && k.indexOf('DiaryBgGallery') === -1;
+                });
+                for (var i = 0; i < diaryKeys.length; i++) {
+                    const existing = await localforage.getItem(diaryKeys[i]);
+                    if (Array.isArray(existing) && existing.length > 0) {
+                        console.warn('[companion-diary] 拒绝用空数组覆盖现有日记数据，跳过保存');
+                        return;
+                    }
+                }
+            }
             await localforage.setItem(getKey(), _diaryEntries);
         } catch (e) {
             console.warn('[companion-diary] save failed:', e);
@@ -70,7 +139,36 @@
             partnerNote: entry.partnerNote || '',
             userNote: entry.userNote || ''
         };
+        // 关键修复：写入前先从 localforage 重新加载最新数据。
+        // 原因：init() 调用 loadDiary() 时 SESSION_ID 可能尚未就绪（异步初始化），
+        // 导致 getKey() 返回无 SESSION_ID 的旧 key，读到 null，_diaryEntries 为空。
+        // 陪伴结束时（SESSION_ID 已就绪），直接 unshift 空数组再 save 会用 [新记录]
+        // 覆盖掉 localforage 正确 key 里的所有历史记录。
+        // 重新 loadDiary() 此时 SESSION_ID 必然已就绪，可读到正确的历史数据。
+        await loadDiary();
+        // 防重复写入（理论上同一条记录不应被写两次）
+        if (_diaryEntries.some(function(e) { return String(e.id) === String(rec.id); })) {
+            console.warn('[companion-diary] 重复 entry，跳过：', rec.id);
+            return;
+        }
         _diaryEntries.unshift(rec);
+        await saveDiary();
+        window._companionDiaryEntries = _diaryEntries;
+    };
+
+    // 供导入逻辑调用：合并写入陪伴日记（以 id 去重，不覆盖已有条目）
+    window._setCompanionDiaryEntries = async function(entries) {
+        if (!Array.isArray(entries) || entries.length === 0) return;
+        await loadDiary(); // 确保内存是最新状态
+        const existingIds = new Set(_diaryEntries.map(function(e) { return String(e.id); }));
+        for (var i = 0; i < entries.length; i++) {
+            var e = entries[i];
+            if (!existingIds.has(String(e.id))) {
+                _diaryEntries.push(e);
+                existingIds.add(String(e.id));
+            }
+        }
+        _diaryEntries.sort(function(a, b) { return b.ts - a.ts; });
         await saveDiary();
         window._companionDiaryEntries = _diaryEntries;
     };
@@ -132,13 +230,28 @@
     };
 
     // ─── 日记背景：应用到 modal 的 .cd-pages 上 ────────
-    window.applyCompanionDiaryBg = function(bgValue) {
+    window.applyCompanionDiaryBg = async function(bgValue) {
         const pages = document.getElementById('cd-pages');
         if (!pages) return;
         if (!bgValue) {
             pages.style.backgroundImage = '';
             pages.style.backgroundColor = '';
             pages.classList.remove('cd-has-bg');
+            return;
+        }
+        // 阶段三B：云端引用先下载
+        if (typeof bgValue === 'string' && bgValue.indexOf('oss://') === 0) {
+            if (!window.CloudMedia) return;
+            try {
+                const blobUrl = await window.CloudMedia.fetchUrl(bgValue);
+                pages.style.backgroundImage = 'url(' + JSON.stringify(blobUrl) + ')';
+                pages.style.backgroundSize = 'cover';
+                pages.style.backgroundPosition = 'center';
+                pages.style.backgroundRepeat = 'no-repeat';
+                pages.classList.add('cd-has-bg');
+            } catch (e) {
+                console.warn('[companion-diary] 云端背景加载失败', e);
+            }
             return;
         }
         if (bgValue.startsWith('linear-gradient') || bgValue.startsWith('#') || bgValue.startsWith('rgb')) {
@@ -707,8 +820,7 @@
 
         // 应用日记背景（如果用户在外观设置里选择了）
         try {
-            const prefix = window.APP_PREFIX || '';
-            const bg = await localforage.getItem(prefix + 'companionDiaryBg');
+            const bg = await localforage.getItem(diaryBgKey());
             window.applyCompanionDiaryBg(bg || '');
         } catch (e) {
             window.applyCompanionDiaryBg('');
@@ -857,12 +969,34 @@
     }
 
     // ─── 日记背景管理 ────────────────────────────────
-    function diaryBgKey()   { return (window.APP_PREFIX || '') + 'companionDiaryBg'; }
-    function diaryBgGalKey() { return (window.APP_PREFIX || '') + 'companionDiaryBgGallery'; }
+    function diaryBgKey() {
+        if (typeof getStorageKey === 'function' && typeof SESSION_ID !== 'undefined' && SESSION_ID) {
+            try { return getStorageKey('companionDiaryBg'); } catch (e) {}
+        }
+        return (window.APP_PREFIX || '') + 'companionDiaryBg';
+    }
+    function diaryBgGalKey() {
+        if (typeof getStorageKey === 'function' && typeof SESSION_ID !== 'undefined' && SESSION_ID) {
+            try { return getStorageKey('companionDiaryBgGallery'); } catch (e) {}
+        }
+        return (window.APP_PREFIX || '') + 'companionDiaryBgGallery';
+    }
 
     async function loadDiaryBgGallery() {
         try {
-            const data = await localforage.getItem(diaryBgGalKey());
+            const newKey = diaryBgGalKey();
+            const oldKey = (window.APP_PREFIX || '') + 'companionDiaryBgGallery';
+            let data = await localforage.getItem(newKey);
+            // 一次性迁移旧键
+            if ((!data || !Array.isArray(data) || data.length === 0) && newKey !== oldKey) {
+                const oldData = await localforage.getItem(oldKey);
+                if (Array.isArray(oldData) && oldData.length > 0) {
+                    data = oldData;
+                    await localforage.setItem(newKey, data);
+                    await localforage.removeItem(oldKey);
+                    console.log('[companion-diary] 日记背景图库已迁移到新键名');
+                }
+            }
             _diaryBgGallery = Array.isArray(data) ? data : [];
         } catch (e) {
             _diaryBgGallery = [];
@@ -873,14 +1007,19 @@
     }
     async function applyDiaryBg(value) {
         try { await localforage.setItem(diaryBgKey(), value || ''); } catch (e) {}
+        // 同时清旧键（如果存在）
+        try {
+            const oldKey = (window.APP_PREFIX || '') + 'companionDiaryBg';
+            if (oldKey !== diaryBgKey()) await localforage.removeItem(oldKey);
+        } catch (e) {}
         if (typeof window.applyCompanionDiaryBg === 'function') {
-            window.applyCompanionDiaryBg(value || '');
+            await window.applyCompanionDiaryBg(value || '');
         }
     }
     async function clearDiaryBg() {
         try { await localforage.removeItem(diaryBgKey()); } catch (e) {}
         if (typeof window.applyCompanionDiaryBg === 'function') {
-            window.applyCompanionDiaryBg('');
+            await window.applyCompanionDiaryBg('');
         }
     }
 
@@ -906,7 +1045,23 @@
             const item = document.createElement('div');
             const isActive = currentBg && currentBg === bg.value;
             item.className = 'bg-item ' + (isActive ? 'active' : '');
-            item.innerHTML = '<img src="' + bg.value + '" loading="lazy" alt="bg">';
+
+            // 阶段三B：云端引用走懒加载 + 缩略图兜底
+            const isCloud = typeof bg.value === 'string' && bg.value.indexOf('oss://') === 0;
+            if (isCloud) {
+                const displaySrc = bg.thumbnail || '';
+                if (displaySrc) {
+                    item.innerHTML = '<img src="' + displaySrc + '" loading="lazy" alt="bg">';
+                } else {
+                    item.innerHTML = '<img loading="lazy" alt="bg">';
+                    const imgEl = item.querySelector('img');
+                    if (window.CloudMedia && imgEl) {
+                        window.CloudMedia.bindLazyImage(imgEl, bg.value);
+                    }
+                }
+            } else {
+                item.innerHTML = '<img src="' + bg.value + '" loading="lazy" alt="bg">';
+            }
 
             item.onclick = (e) => {
                 if (e.target.closest('.bg-delete-btn')) return;
@@ -922,6 +1077,20 @@
             delBtn.onclick = async (e) => {
                 e.stopPropagation();
                 if (confirm('确定删除这张日记背景吗？')) {
+                    // 阶段三B：如果有云端引用，先删云端对象（失败不阻塞本地删除）
+                    if (window.CloudMedia && bg && bg.cloudKey) {
+                        try {
+                            await window.CloudMedia.delete(bg.cloudKey);
+                        } catch (err) {
+                            console.warn('[cloud-media] 云端删除失败', err);
+                        }
+                    } else if (window.CloudMedia && bg && typeof bg.value === 'string' && bg.value.indexOf('oss://') === 0) {
+                        try {
+                            await window.CloudMedia.delete(bg.value);
+                        } catch (err) {
+                            console.warn('[cloud-media] 云端删除失败', err);
+                        }
+                    }
                     _diaryBgGallery.splice(index, 1);
                     await saveDiaryBgGallery();
                     if (isActive) await clearDiaryBg();
@@ -948,13 +1117,39 @@
                 const reader = new FileReader();
                 reader.onload = async (ev) => {
                     const base64 = ev.target.result;
-                    _diaryBgGallery.push({
-                        id: 'user-' + Date.now(),
-                        type: 'image',
-                        value: base64
-                    });
+                    const bgId = 'user-' + Date.now();
+
+                    // 阶段三B：如果已连云端，上传全尺寸到云端，本地只存缩略图
+                    let stored = { id: bgId, type: 'image', value: base64 };
+                    let valueToApply = base64;
+                    if (window.CloudMedia && window.CloudSync && window.CloudSync.isConnected()) {
+                        if (typeof showNotification === 'function') showNotification('正在上传到云端...', 'info', 2000);
+                        try {
+                            const uploadResult = await window.CloudMedia.upload(base64, 'diary-backgrounds', bgId);
+                            let thumb = null;
+                            try {
+                                thumb = await window.CloudMedia.makeThumbnail(base64, 200);
+                            } catch (thumbErr) {
+                                console.warn('[cloud-media] 日记背景缩略图生成失败', thumbErr);
+                            }
+                            stored = {
+                                id: bgId,
+                                type: 'image',
+                                value: uploadResult.url,
+                                thumbnail: thumb,
+                                cloudKey: uploadResult.key
+                            };
+                            valueToApply = uploadResult.url;
+                        } catch (err) {
+                            console.warn('[cloud-media] 日记背景上传失败，降级为本地存储', err);
+                            if (typeof showNotification === 'function') showNotification('云端上传失败，暂存本地', 'error', 2500);
+                            // stored 保持默认（本地 base64）
+                        }
+                    }
+
+                    _diaryBgGallery.push(stored);
                     await saveDiaryBgGallery();
-                    await applyDiaryBg(base64);
+                    await applyDiaryBg(valueToApply);
                     renderDiaryBgGallery();
                     if (typeof showNotification === 'function') showNotification('日记背景已添加并应用', 'success');
                 };
